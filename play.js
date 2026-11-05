@@ -4869,7 +4869,8 @@ const AUTO_MENU_LIST = [
   ['eat', '吃点背包里的东西垫肚子'],
   ['mobs', '列附近实体/动物（找吃的、找怪都用它），args: {range:64}'],
   ['fish', '在附近水里钓鱼（需要钓竿，64 格内找水、会走过去；天黑不下钩），args: {casts:3, timeout:25000, force:false}'],
-  ['chest', '存/取/看箱子（清背包唯一有效的办法，toss 会被服务器回滚），args: {mode:"store|take|list", items:[...], preset:"junk", chest:"箱子名"}。给个新名字会自动新放一个箱子并记住坐标，比如 chest:"vault" 当保险箱'],
+  ['chest', '存/取/看箱子（清背包首选），args: {mode:"store|take|list", items:[...], preset:"junk", chest:"箱子名"}。给个新名字会自动新放一个箱子并记住坐标，比如 chest:"vault" 当保险箱；没有箱子时 store 会自动把垃圾就地扔地上（服务器很快就清掉）。preset:"junk" 走的是可开关的杂物清单（默认关，junk op:"on" 才开）；不信这个服的清单就自己给 items'],
+  ['toss', '把某样东西直接扔地上（清包兜底，没有箱子也能用；丢出去约 1 秒就被服务器清掉，不会回来），args: {item:"英文id", count}'],
   ['armor', '换上背包里最好的护甲'],
   ['craft', '搓东西（木板/木棍/工作台/工具武器都行），args: {item:"英文id", count}；没工作台会自己搓一张摆上'],
   ['attack', '打附近的怪（自动换武器/追击/跳劈），args: {count 最多几只(默认2), secs 最多打几秒(默认15)}'],
@@ -4927,10 +4928,15 @@ function scanAround(r = 5) {
 function autoCtxJson() {
   const info = (perceive() || {}).extra || {};
   let inv = '空';
+  let invUse = 0;
   try {
-    inv = (bot.inventory.items() || []).slice().sort((a, b) => b.count - a.count)
+    const its = bot.inventory.items() || [];
+    invUse = its.length;
+    inv = its.slice().sort((a, b) => b.count - a.count)
       .slice(0, 10).map(i => `${i.name}x${i.count}`).join(',') || '空';
   } catch (e) {}
+  const invTxt = inv === '空' ? '空'
+    : `${inv}（占用 ${invUse}/36${invUse >= 32 ? '，快满了：先 chest 存箱子，没箱子就 toss 扔垃圾' : ''}）`;
   let day = '不知道';
   try { day = bot.time.timeOfDay < 13000 ? '白天' : '晚上'; } catch (e) {}
   const players = (info.players || []).map(x => `${x.name}(距${x.dist})`).join('、') || '附近没人';
@@ -4941,7 +4947,7 @@ function autoCtxJson() {
     脚下: info.below, 脚底: info.feet,
     周围方块: scanAround(5),
     附近玩家: players,
-    背包: inv,
+    背包: invTxt,
     正在盖房: !!info.building,
     正在跟人: !!info.following,
     当前目标: goalCtxForAuto(),
@@ -5478,11 +5484,26 @@ actRegister('toss', async (a) => {
   }
 });
 
-// ---------- 容器存取：toss 被服务器回滚，清背包只能靠「存进箱子」 ----------
+// ---------- 容器存取：箱子优先，实在没有箱子就扔地上（实测服务器 ~1s 就清掉落物） ----------
 const CONTAINER_NAMES = ['chest', 'trapped_chest', 'barrel'];
-const JUNK_PRESET = ['red_mushroom', 'rotten_flesh', 'phantom_membrane', 'leaf_litter', 'gunpowder',
+// 杂物（垃圾）预设清单：默认「关」，且清单可改——不同服的「垃圾」不一样，
+// 有的服里这几样恰恰是稀罕东西，绝不能无脑往里塞。
+const JUNK_DEFAULT = ['red_mushroom', 'rotten_flesh', 'phantom_membrane', 'leaf_litter', 'gunpowder',
   'bone', 'string', 'arrow', 'lead', 'copper_leggings', 'copper_helmet', 'copper_boots',
   'copper_chestplate', 'dark_oak_sapling', 'dirt'];
+const JUNK_FILE = path.join(__dirname, 'junk.json');
+function loadJunkCfg() {
+  let o = {};
+  try { o = JSON.parse(fs.readFileSync(JUNK_FILE, 'utf8')) || {}; } catch (e) {}
+  const enabled = (typeof o.enabled === 'boolean') ? o.enabled : false;   // 默认关，怕误存
+  const src = Array.isArray(o.items) ? o.items : JUNK_DEFAULT;
+  const items = src.map((n) => String(n).toLowerCase().replace(/^minecraft:/, '').trim()).filter(Boolean);
+  return { enabled, items };
+}
+function saveJunkCfg(cfg) {
+  try { return !!PLAT.writeJsonAtomic(JUNK_FILE, { enabled: !!cfg.enabled, items: (cfg.items || []).slice() }, { space: 2 }); }
+  catch (e) { log('junkWriteErr ' + (e.message || e)); return false; }
+}
 const CHEST_FILE = path.join(__dirname, 'chests.json');
 function loadChests() { try { return JSON.parse(fs.readFileSync(CHEST_FILE, 'utf8')) || {}; } catch (e) { return {}; } }
 function saveChests(o) { PLAT.writeJsonAtomic(CHEST_FILE, o, { space: 2 }); }
@@ -5514,13 +5535,79 @@ async function placeItemAt(itemName, p) {
   }
   return false;
 }
+// 清背包兜底：把指定物品就地扔掉。扔的时候先关自动拾取，免得自己又捡回来
+async function tossNames(names) {
+  const moved = {};
+  const skipped = [];
+  const prevPick = AUTO_PICKUP;
+  AUTO_PICKUP = false;
+  try {
+    for (const nm of names) {
+      const stacks = bot.inventory.items().filter((i) => i.name === nm || i.name === 'minecraft:' + nm);
+      if (!stacks.length) { skipped.push(nm); continue; }
+      let n = 0;
+      for (const st of stacks) {
+        try { await bot.toss(st.type, null, st.count); n += st.count; } catch (e) { break; }
+        await bot.waitForTicks(4);
+      }
+      if (n) moved[nm] = n; else skipped.push(nm);
+    }
+    await bot.waitForTicks(6);
+  } finally { AUTO_PICKUP = prevPick; }
+  return { moved, skipped, invUsed: (bot.inventory.items() || []).length };
+}
+// 杂物清单开关：list/on/off/add/remove/set/reset（不依赖进服，离线也能改）
+actRegister('junk', async (a) => {
+  const op = String((a && (a.op || a.action || a.mode)) || 'list').toLowerCase();
+  const cfg = loadJunkCfg();
+  const clean = (arr) => arr.map((s) => String(s).toLowerCase().replace(/^minecraft:/, '').trim()).filter(Boolean);
+  const want = Array.isArray(a && a.items) ? clean(a.items) : (a && a.item ? clean([a.item]) : []);
+  const okMsg = (msg) => ({ ok: true, msg, extra: { enabled: cfg.enabled, items: cfg.items } });
+  if (op === 'list' || op === 'status' || op === 'show') {
+    return okMsg(`杂物清单现在${cfg.enabled ? '开着' : '关着'}，共 ${cfg.items.length} 种：${cfg.items.join(', ')}`);
+  }
+  if (op === 'on' || op === 'enable' || op === 'off' || op === 'disable') {
+    cfg.enabled = (op === 'on' || op === 'enable');
+    saveJunkCfg(cfg);
+    return okMsg(`杂物清单已${cfg.enabled ? '打开' : '关闭'}（清单 ${cfg.items.length} 种）`);
+  }
+  if (op === 'add' || op === 'remove' || op === 'del' || op === 'delete' || op === 'rm') {
+    if (!want.length) return { ok: false, msg: '要加/删哪几样？给我 items（英文 id）' };
+    if (op === 'add') { for (const n of want) if (cfg.items.indexOf(n) < 0) cfg.items.push(n); }
+    else cfg.items = cfg.items.filter((n) => want.indexOf(n) < 0);
+    saveJunkCfg(cfg);
+    return okMsg(`${op === 'add' ? '加进去了' : '删掉了'}，现在 ${cfg.items.length} 种：${cfg.items.join(', ')}`);
+  }
+  if (op === 'set') {
+    if (!want.length) return { ok: false, msg: 'set 要给我完整清单 items' };
+    cfg.items = want;
+    saveJunkCfg(cfg);
+    return okMsg(`清单换成 ${cfg.items.length} 种：${cfg.items.join(', ')}`);
+  }
+  if (op === 'reset') {
+    cfg.items = JUNK_DEFAULT.slice();
+    saveJunkCfg(cfg);
+    return okMsg(`清单恢复默认 ${cfg.items.length} 种（开关状态没动）`);
+  }
+  return { ok: false, msg: 'junk 只支持 list / on / off / add / remove / set / reset' };
+});
+
 actRegister('chest', async (a) => {
   // 存/取/看箱子。mode: store(默认) | take | list    items:[...] 或 item:"x"
   if (!bot || !bot.entity) return { ok: false, msg: '我还没进服呢' };
   const mode = String((a && a.mode) || 'store').toLowerCase();
   let names = Array.isArray(a && a.items) ? a.items.map((s) => String(s).toLowerCase())
     : (a && a.item ? [String(a.item).toLowerCase()] : []);
-  if ((a && a.preset) === 'junk' || (mode === 'store' && !names.length)) names = JUNK_PRESET.slice();
+  const jcfg = loadJunkCfg();
+  const wantJunk = (a && a.preset) === 'junk';
+  if (wantJunk || (mode === 'store' && !names.length)) {
+    if (!jcfg.enabled) {
+      return { ok: false, msg: wantJunk
+        ? `杂物清单现在是关着的（怕把这服的稀罕物当垃圾存了）。要开就说 junk op:"on"，或者直接给我 items 指定存什么。清单可改：junk op:"add" items:["dirt"]`
+        : `没给 items，杂物清单也关着，我不知道该存啥。给我 items，或者 junk op:"on" 打开预设清单` };
+    }
+    names = jcfg.items.slice();
+  }
   names = names.map((n) => n.replace(/^minecraft:/, ''));
 
   const cname = String((a && a.chest) || '').toLowerCase();
@@ -5540,9 +5627,22 @@ actRegister('chest', async (a) => {
     block = findChestBlock(8);
   }
   let placedAt = null;
+  // 兜底：没有箱子就就地扔（这个服掉落物 ~1 秒被清，扔了就是真没了）
+  const tossFallback = async (why, note) => {
+    const t = await tossNames(names);
+    const pairs = Object.entries(t.moved).map(([k, v]) => k + 'x' + v);
+    return {
+      ok: true,
+      msg: `${note}${pairs.length ? '，就地扔掉了 ' + pairs.join(',') : (t.skipped.length ? '，背包里也没有可扔的' : '，也没东西好扔')}；背包现在占用 ${t.invUsed} 格`,
+      extra: { why: why + '_tossed', moved: t.moved, skipped: t.skipped, invUsed: t.invUsed, placedAt },
+    };
+  };
   if (!block && mode !== 'list') {
     const have = CONTAINER_NAMES.find((n) => invCountOf(n) > 0);
-    if (!have) return { ok: false, msg: '背包里没有箱子/木桶，没法开容器', extra: { why: 'no_container_item' } };
+    if (!have) {
+      if (!(a && a.fallbackToss === false)) return await tossFallback('no_container_item', '没箱子没木桶');
+      return { ok: false, msg: '背包里没有箱子/木桶，没法开容器', extra: { why: 'no_container_item' } };
+    }
     const spot = findFreePlaceSpot(bot.entity.position.floored().offset(1, 0, 0), 4) || findOpenStand(4);
     if (!spot) return { ok: false, msg: '附近找不到能放箱子的空地', extra: { why: 'no_spot' } };
     if (!nearEnough(spot)) await walkTo(spot, 2.8, 6000);
@@ -5555,6 +5655,7 @@ actRegister('chest', async (a) => {
     if (cname && isContainerBlock(block)) { reg[cname] = [spot.x, spot.y, spot.z]; saveChests(reg); }
   }
   if (!block) {
+    if (mode !== 'take' && !(a && a.fallbackToss === false)) return await tossFallback('no_chest', '附近没箱子');
     let msg;
     if (cname) {
       msg = stale
