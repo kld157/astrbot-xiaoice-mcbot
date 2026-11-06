@@ -146,6 +146,12 @@ Windows 上守护建议放「任务计划程序」里开机启动 `node launcher
 | `MC_FORCE_SURVIVAL` | `1` | 上线若被切换为冒险模式，自动执行 `/gamemode survival` |
 | `MC_USAGE_KEEP_DAYS` | `90` | 用量账本保留天数（`<=0` 表示不清理） |
 | `LLM_KEY` | 必填 | 大模型 API key，写在 `mc.env`；`llm.json` 里不写明文 |
+| `MC_LLM_SOURCE` | `auto` | 模型从哪来：`own` 只用 `llm.json` + `mc.env`（不装 AstrBot 就用这个），`astrbot` 只用 AstrBot 的配置，`auto` 自己的优先、没配 key 才去找 AstrBot |
+| `MC_ASTRBOT_CONFIG` | `/AstrBot/data/cmd_config.json` | 装了 AstrBot 时它的配置路径；文件不存在就自动跳过 |
+
+> **不装 AstrBot 也没问题**：模型只认 `llm.json`（走哪家、什么模型）+ `mc.env` 里的 `LLM_KEY`。
+> AstrBot 的配置只有在 `auto` 且自己没配 key、或 `MC_LLM_SOURCE=astrbot` 时才会被读。
+
 
 > `mc.env`、`llm.json`、日志、用量账本均已列入 `.gitignore`，仓库中只保留占位值；
 > 缺失 `MC_HOST` 时脚本会直接报错退出。
@@ -257,6 +263,21 @@ ACT {"id":"1","name":"goto","args":{"x":100,"y":64,"z":200}}
 
 `chest` 支持三种定位：已登记的名称（`chest:"west"`，坐标存于 `chests.json`）、
 未命名时取最近容器、或直接给出 `x/y/z`。未登记的名称不会被当作容器打开。
+
+### 慢动作会「后补一句」
+
+挖矿、盖房、赶路这类活儿比一次说话慢得多：`mc_bridge.py` 一般等 32 秒（`perceive` 这种快动作等 8 秒），
+等不到就**不算失败**，而是把这次动作挂进 `.bridge_state.json` 的 `pending`，
+然后先回你一句「我先干着」。等 `act_out.json` 里真的出现回执，主循环再把结果补成一句话，
+说给当初叫你干活的那个人听：
+
+```
+你：帮我把这片石头挖了        →  小冰：行，我这就挖，挖完喊你～
+（两分钟后，公开聊天）        →  小冰：搞定啦～挖到 12 个 cobblestone
+```
+
+挂起状态存在磁盘上，重启 bridge（甚至被看门狗拉起来）都不会丢；超过 5 分钟还没回音的活儿，
+她会主动说一句「那个活儿没信儿了」，不会一直吊着你。
 
 ### 杂物清单（`preset:"junk"` 的开关）
 
@@ -390,7 +411,9 @@ mc_usage/             用量账本（按天生成，运行时产物；供 AstrBo
 - **[mineflayer](https://github.com/PrismarineJS/mineflayer)** 与 **[PrismarineJS](https://github.com/PrismarineJS)**：整个项目的连接、物理与寻路都建立在它们之上。
 - **[minecraft-data](https://github.com/PrismarineJS/minecraft-data)**：方块、配方与协议数据的来源。
 - **[AstrBot](https://github.com/AstrBotDevs/AstrBot)**：小冰最初就是跑在 AstrBot 上的聊天机器人，人格设定和对话能力都在那里长成形。
-  > 注：AstrBot **仅**用于聊天侧接入（让小冰在 QQ / 频道里说话）；**MC 机器人本体不依赖 AstrBot**，不装它也能直接 `./start.sh` 独立运行。
+  > 注：AstrBot **仅**为可选的接入（`MC_LLM_SOURCE`，默认 `auto`）；
+  > **MC 机器人本体不依赖 AstrBot**，只要 `llm.json` + `mc.env` 里的 `LLM_KEY` 配好，
+  > 不装它也能直接 `./start.sh` 独立运行。
 - **[MaiBot](https://github.com/Mai-with-u/MaiBot)**：本项目的**设计思路参考** —— README 的章节组织、「最像而不是好」这套表达方式，都受了它启发。
   > 注：**仅**为项目设计思路参考，本项目不含 MaiBot 的任何代码，也不依赖它运行。
 
